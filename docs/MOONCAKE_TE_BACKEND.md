@@ -1,6 +1,12 @@
 # Mooncake Transfer Engine as an RDMA backend (prototype)
 
-**Branch:** `mooncake-te-backend` | **Status:** working prototype, tested on EFA | **Date:** 2026-10-27
+**Branch:** [`whn09/valkey-large-object@mooncake-te-backend`](https://github.com/whn09/valkey-large-object/tree/mooncake-te-backend)
+([diff vs `valkey-io/main`](https://github.com/valkey-io/valkey-large-object/compare/main...whn09:valkey-large-object:mooncake-te-backend))
+| **Status:** working prototype, tested on EFA | **Date:** 2026-10-27
+
+**Depends on (Mooncake):** [kvcache-ai/Mooncake#4976](https://github.com/kvcache-ai/Mooncake/pull/4976)
+(EFA honors `remote_accessible`; required for safe deployment) and
+[kvcache-ai/Mooncake#4961](https://github.com/kvcache-ai/Mooncake/pull/4961) (Rust build fix).
 
 ## Summary
 
