@@ -59,6 +59,8 @@ impl Fabric {
                 local_hostname: crate::te_local_hostname(),
                 metadata_server: crate::te_metadata_server(),
                 protocol: crate::te_protocol(),
+                locations: crate::te_locations(),
+                crc_threads: crate::fabric_crc_pool_threads(),
             })?),
             #[cfg(not(feature = "mooncake-te"))]
             FabricProvider::MooncakeTe => {

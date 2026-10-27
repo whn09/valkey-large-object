@@ -330,6 +330,7 @@ valkey_module! {
             ["te-local-hostname", &*CFG_TE_LOCAL_HOSTNAME, "", ConfigurationFlags::IMMUTABLE, None],
             ["te-metadata-server", &*CFG_TE_METADATA_SERVER, DEFAULT_TE_METADATA_SERVER, ConfigurationFlags::IMMUTABLE, None],
             ["te-protocol", &*CFG_TE_PROTOCOL, DEFAULT_TE_PROTOCOL, ConfigurationFlags::IMMUTABLE, None],
+            ["te-locations", &*CFG_TE_LOCATIONS, "", ConfigurationFlags::IMMUTABLE, None],
         ],
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],

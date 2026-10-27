@@ -36,7 +36,7 @@ streaming are unchanged. Only `src/transport/` knows which backend is running.
 | `BLOB.RDMA_HELLO <hex>` | client's 32-byte EFA address, `fi_av_insert` | client's TE segment name (e.g. `10.0.0.5:16643`), `open_segment` |
 | HELLO reply | one EFA address per domain | the server's TE segment name |
 | GET / SET triple `(rkey, addr, len)` | used as-is | `addr` used; `rkey` ignored (TE resolves keys at handshake) |
-| Completion | vdma worker wakes the future | a poller thread polls `get_transfer_status`, computes the CRC32C for SET, wakes the future |
+| Completion | vdma worker wakes the future | a poller thread polls `get_transfer_status` and wakes the future; SET reads are checksummed on `fabric-crc-pool-threads` threads first |
 
 Code: `src/transport/te.rs` is new. `fabric.rs` now dispatches between the two backends, and a
 `TransferHandle` future wraps both kinds of transfer. The other changes are small: new configs in
@@ -61,8 +61,11 @@ New configs, all immutable:
 | `te-local-hostname` | (required) | IP, or `ip:port`, used for the TE handshake |
 | `te-metadata-server` | `P2PHANDSHAKE` | TE metadata service, or an etcd/http URI |
 | `te-protocol` | `efa` | TE transport: `efa`, `rdma`, `tcp`, ... |
+| `te-locations` | `*` | Comma-separated TE locations for pool segments, round-robin, e.g. `cpu:0,cpu:3` (see the multi-NIC results) |
 
-## Results (2× r8i.48xlarge, 1 EFA NIC each, about 75 Gbps)
+`fabric-crc-pool-threads` (an existing config) also sets the TE backend's checksum threads.
+
+## Results: single NIC (2× r8i.48xlarge, 1 EFA NIC each, about 75 Gbps)
 
 - **Correctness.** Round trip SET → GET → SET → TCP_GET at 4 KB, 1 MB, 8 MB, and 64 MB + 12345
   bytes (multi-chunk, unaligned). Bytes and CRCs match, and the CRCs are identical to the
@@ -76,9 +79,40 @@ New configs, all immutable:
 | 1 MB | 4 | 9.33 GB/s | 9.33 GB/s |
 | 16–64 MB | 1 | ≈9.3 GB/s | ≈9.3 GB/s |
 
-  The two backends perform the same within noise, and both reach line rate. A single NIC can't
-  show TE's multi-NIC advantage, so that still needs p5/p5en numbers. On both backends, small
-  objects are limited by the per-object RESP round trip (about 80 µs), not by RDMA.
+  The two backends perform the same within noise, and both reach line rate. On both backends,
+  small objects are limited by the per-object RESP round trip (about 80 µs), not by RDMA.
+
+## Results: two NICs (2× r8idn.96xlarge, 2 EFA NICs each, 600 Gbps ≈ 75 GB/s)
+
+Server and client run on separate hosts, use 8 checksum threads, and use up to 32 connections.
+For TE, the server runs with `te-locations cpu:0,cpu:3` and the client runs one TE target per
+NIC-bearing NUMA node. The numbers are peak throughput over 1–64 MB objects.
+
+| | GET | SET |
+|---|---|---|
+| efa-direct | 38.1 GB/s (one NIC) | 37.9 GB/s (one NIC) |
+| **TE** | **75.9 GB/s (both NICs, line rate)** | **60.3 GB/s** |
+
+Per-NIC hardware counters confirm the split: under TE, each of the client's two NICs carries
+about 38 GB/s.
+
+What we learned on the way:
+
+- **efa-direct is capped at one NIC per session.** HELLO carries one client address, so every
+  transfer to that client lands on one client NIC, however many server NICs send it.
+- **TE picks a host buffer's NICs by NUMA node**, and it resolves the `*` location from the
+  buffer's first page. A pool that lives on one NUMA node therefore uses only that node's NIC. In
+  the first run (default `*`) TE also topped out at one NIC, 37.7 GB/s. `te-locations` spreads
+  the pool segments across nodes, and the client must spread its buffers the same way. A
+  NUMA-aware segment allocator, which binds each segment's pages to the node it is registered
+  under, would be the proper version of this.
+- **Checksums capped SET** at about 9–11 GB/s with one checksum thread, on both backends. This is
+  fixed with `fabric-crc-pool-threads 8`, which the TE backend now honors as well.
+- With only a few hot objects, all of them can sit in one segment, which means one NIC. 1 MB
+  GETs therefore stayed at 37.9 GB/s even with 32 connections. Workloads that spread objects
+  across many segments don't hit this.
+- Also tested on these hosts: kvcache-ai/Mooncake#4976's unit tests pass (4/4, plus
+  `efa_transport_test` 11/11).
 
 - **Refactor safety.** The refactored efa-direct path passes the same round-trip test. Clippy is
   clean with and without the feature.
@@ -98,10 +132,11 @@ is merged.**
 ## Known limitations / next steps
 
 - **Not run yet:** the module's pytest suite (`build.sh integ-test`, Emulated provider). Not
-  tested yet: multi-NIC hosts, GPU memory, and the Tiered mode staging path over TE.
+  tested yet: GPU memory, and the Tiered mode staging path over TE.
 - **Prototype shortcuts:**
   - one TE batch per transfer;
-  - CRC computed on the single poller thread;
+  - `te-locations` labels segments without binding their pages to the node (the run above used
+    `numactl --interleave` on the server);
   - `libasio.so` needs `LD_LIBRARY_PATH` (no rpath);
   - client segments are not closed on disconnect, because connections from one client process
     share a segment.

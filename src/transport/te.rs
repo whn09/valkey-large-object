@@ -12,11 +12,13 @@
 //!   RMA into it.
 //!
 //! TE has no completion callback. `transfer` submits on the calling thread, and one poller thread
-//! watches every in-flight batch, checksums reads that asked for it, and wakes the waiting task.
+//! watches every in-flight batch and wakes the waiting task. Reads that asked for a checksum go
+//! to a pool of `fabric-crc-pool-threads` threads first, so hashing does not cap the poller.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
@@ -38,6 +40,13 @@ pub struct TeConfig {
     pub metadata_server: String,
     /// TE transport to install: `efa`, `rdma`, `tcp`, ...
     pub protocol: String,
+    /// Locations pool segments are registered under, assigned round-robin (e.g. `cpu:0`,
+    /// `cpu:3`). TE sends a host buffer's slices over its location's NUMA-local NICs, and
+    /// resolves `*` from the buffer's first page, so a pool on one NUMA node uses only that
+    /// node's NICs. Spreading segments over the NIC-bearing nodes spreads the traffic.
+    pub locations: Vec<String>,
+    /// Threads checksumming completed reads.
+    pub crc_threads: usize,
 }
 
 pub struct TeBackend {
@@ -49,9 +58,15 @@ pub struct TeBackend {
     peers: Mutex<HashMap<u64, SegmentId>>,
     /// Bases of the pool segments registered with the engine.
     registered: Mutex<HashSet<usize>>,
+    /// See `TeConfig::locations`; never empty.
+    locations: Vec<String>,
+    /// Segments registered so far, picking each one's location.
+    next_location: AtomicUsize,
     /// `None` only while dropping: closing it lets the poller drain and exit.
     submit: Option<Sender<InFlight>>,
     poller: Option<JoinHandle<()>>,
+    /// Exit once the poller, which holds their channel, has.
+    crc_workers: Vec<JoinHandle<()>>,
 }
 
 impl TeBackend {
@@ -71,18 +86,43 @@ impl TeBackend {
             .map_err(|error| format!("transfer engine local address: {error}"))?;
         let engine = Arc::new(engine);
         let (submit, completions) = crossbeam_channel::unbounded();
+        let (to_checksum, checksums) = crossbeam_channel::unbounded::<InFlight>();
+        let mut crc_workers = Vec::new();
+        for index in 0..config.crc_threads.max(1) {
+            let checksums = checksums.clone();
+            let worker = std::thread::Builder::new()
+                .name(format!("largeobj-te-crc{index}"))
+                .spawn(move || {
+                    for transfer in checksums {
+                        let crc = transfer.checksum();
+                        transfer.finish(Ok(TransferDone {
+                            bytes: transfer.length,
+                            checksum: Some(crc),
+                        }));
+                    }
+                })
+                .map_err(|error| format!("transfer engine crc thread: {error}"))?;
+            crc_workers.push(worker);
+        }
         let poller_engine = Arc::clone(&engine);
         let poller = std::thread::Builder::new()
             .name("largeobj-te".into())
-            .spawn(move || poll_completions(&poller_engine, &completions))
+            .spawn(move || poll_completions(&poller_engine, &completions, &to_checksum))
             .map_err(|error| format!("transfer engine poller: {error}"))?;
         Ok(Self {
             engine,
             local_name: local_name.into_bytes(),
             peers: Mutex::new(HashMap::new()),
             registered: Mutex::new(HashSet::new()),
+            locations: if config.locations.is_empty() {
+                vec![WILDCARD_LOCATION.to_string()]
+            } else {
+                config.locations.clone()
+            },
+            next_location: AtomicUsize::new(0),
             submit: Some(submit),
             poller: Some(poller),
+            crc_workers,
         })
     }
 
@@ -92,16 +132,18 @@ impl TeBackend {
 
     pub fn register_segment(&self, segment: &'static [u8]) -> Result<(), String> {
         let base = segment.as_ptr() as usize;
+        let index = self.next_location.fetch_add(1, Ordering::Relaxed);
+        let location = &self.locations[index % self.locations.len()];
         // SAFETY: pool segments live until `release_segment`, which unregisters first.
         unsafe {
             self.engine.register_local_memory_ex(
                 segment.as_ptr().cast_mut().cast(),
                 segment.len(),
-                WILDCARD_LOCATION,
+                location,
                 false,
             )
         }
-        .map_err(|error| format!("transfer engine registration: {error}"))?;
+        .map_err(|error| format!("transfer engine registration ({location}): {error}"))?;
         self.registered
             .lock()
             .expect("TeBackend.registered lock unavailable")
@@ -211,10 +253,14 @@ impl TeBackend {
 
 impl Drop for TeBackend {
     fn drop(&mut self) {
-        // Closing the channel lets the poller finish what is in flight, then exit.
+        // Closing the channel lets the poller finish what is in flight, then exit; its exit closes
+        // the checksum channel in turn.
         drop(self.submit.take());
         if let Some(poller) = self.poller.take() {
             let _ = poller.join();
+        }
+        for worker in self.crc_workers.drain(..) {
+            let _ = worker.join();
         }
     }
 }
@@ -232,19 +278,11 @@ struct InFlight {
 }
 
 impl InFlight {
-    /// Resolve the transfer if its batch is terminal. Returns whether it did.
-    fn try_finish(&self, engine: &TransferEngine) -> bool {
-        let outcome: Outcome = match engine.get_transfer_status(self.batch, 0) {
-            Ok(status) if !status.is_terminal() => return false,
-            Ok(status) if status.is_completed() => Ok(TransferDone {
-                bytes: self.length,
-                checksum: self.want_checksum.then(|| {
-                    // SAFETY: the read has landed and the initiator still owns the buffer.
-                    let data =
-                        unsafe { std::slice::from_raw_parts(self.local as *const u8, self.length) };
-                    crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, data) as u32
-                }),
-            }),
+    /// `None` while the batch is in flight; once it is terminal, its result, with the batch freed.
+    fn poll_status(&self, engine: &TransferEngine) -> Option<Result<(), DmaError>> {
+        let result = match engine.get_transfer_status(self.batch, 0) {
+            Ok(status) if !status.is_terminal() => return None,
+            Ok(status) if status.is_completed() => Ok(()),
             Ok(status) => Err(DmaError::Transfer(format!(
                 "transfer engine status {:?}",
                 status.status
@@ -254,6 +292,17 @@ impl InFlight {
             ))),
         };
         let _ = engine.free_batch_id(self.batch);
+        Some(result)
+    }
+
+    fn checksum(&self) -> u32 {
+        // SAFETY: the read has landed and the initiator still owns the buffer.
+        let data = unsafe { std::slice::from_raw_parts(self.local as *const u8, self.length) };
+        crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, data) as u32
+    }
+
+    /// Hand the outcome to the waiting task.
+    fn finish(&self, outcome: Outcome) {
         let waker = {
             let mut slot = self.slot.lock().expect("TeTransfer slot lock unavailable");
             slot.outcome = Some(outcome);
@@ -262,13 +311,17 @@ impl InFlight {
         if let Some(waker) = waker {
             waker.wake();
         }
-        true
     }
 }
 
 /// Poll every in-flight batch until it is terminal. Blocks on the channel while idle; exits once
-/// the channel is closed and nothing is left in flight.
-fn poll_completions(engine: &TransferEngine, submissions: &Receiver<InFlight>) {
+/// the channel is closed and nothing is left in flight. Completed reads that want a checksum go to
+/// the checksum threads, which finish them.
+fn poll_completions(
+    engine: &TransferEngine,
+    submissions: &Receiver<InFlight>,
+    to_checksum: &Sender<InFlight>,
+) {
     let mut in_flight: Vec<InFlight> = Vec::new();
     loop {
         if in_flight.is_empty() {
@@ -281,7 +334,32 @@ fn poll_completions(engine: &TransferEngine, submissions: &Receiver<InFlight>) {
             in_flight.push(next);
         }
         let before = in_flight.len();
-        in_flight.retain(|transfer| !transfer.try_finish(engine));
+        let mut index = 0;
+        while index < in_flight.len() {
+            let Some(result) = in_flight[index].poll_status(engine) else {
+                index += 1;
+                continue;
+            };
+            let transfer = in_flight.swap_remove(index);
+            match result {
+                Ok(()) if transfer.want_checksum => {
+                    if let Err(unsent) = to_checksum.send(transfer) {
+                        // Checksum threads are gone (only while dropping): hash here instead.
+                        let transfer = unsent.into_inner();
+                        let crc = transfer.checksum();
+                        transfer.finish(Ok(TransferDone {
+                            bytes: transfer.length,
+                            checksum: Some(crc),
+                        }));
+                    }
+                }
+                Ok(()) => transfer.finish(Ok(TransferDone {
+                    bytes: transfer.length,
+                    checksum: None,
+                })),
+                Err(error) => transfer.finish(Err(error)),
+            }
+        }
         if in_flight.len() == before {
             std::thread::yield_now();
         }

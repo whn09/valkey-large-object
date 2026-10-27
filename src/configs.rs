@@ -283,6 +283,9 @@ lazy_static::lazy_static! {
     /// Transfer Engine transport to install. Default: efa.
     pub static ref CFG_TE_PROTOCOL: Mutex<String> = Mutex::new(DEFAULT_TE_PROTOCOL.to_string());
 
+    /// Comma-separated Transfer Engine locations for pool segments, round-robin. Default: `*`.
+    pub static ref CFG_TE_LOCATIONS: Mutex<String> = Mutex::new(String::new());
+
     /// Cap on segment bytes EFA-registered (DRAM pool + staging), kept under the EFA
     /// device's registration limit. 0 = no limit. Default: 380 GiB.
     pub static ref CFG_MAX_RDMA_REGISTERED_BYTES: AtomicI64 = AtomicI64::new(DEFAULT_MAX_RDMA_REGISTERED_BYTES);
@@ -544,6 +547,17 @@ pub fn te_protocol() -> String {
         .lock()
         .expect("CFG_TE_PROTOCOL lock unavailable")
         .clone()
+}
+
+pub fn te_locations() -> Vec<String> {
+    CFG_TE_LOCATIONS
+        .lock()
+        .expect("CFG_TE_LOCATIONS lock unavailable")
+        .split(',')
+        .map(str::trim)
+        .filter(|location| !location.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 pub fn max_rdma_registered_bytes() -> u64 {
