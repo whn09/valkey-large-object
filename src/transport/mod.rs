@@ -6,8 +6,10 @@ pub mod config;
 pub mod fabric;
 pub mod operand;
 pub mod session;
+#[cfg(feature = "mooncake-te")]
+pub mod te;
 
-pub use fabric::{commit, fabric, shutdown, Fabric};
+pub use fabric::{commit, fabric, shutdown, Fabric, TransferHandle};
 pub use session::Session;
 
 // ─── EFA Types ───────────────────────────────────────────────────────────────

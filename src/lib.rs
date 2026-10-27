@@ -15,7 +15,8 @@
 // Module init proceeds in strict order. Commands are safe to call ONLY after
 // all steps complete:
 //
-//   1. Fabric::start()         — one libfabric service per domain. On missing
+//   1. Fabric::open()          — the fabric-provider's backend (one libfabric service per
+//                                domain, or one Mooncake Transfer Engine). On missing
 //                                fabric, the EFA path is unavailable and BLOB.RDMA_HELLO
 //                                gives an error.
 //   2. storage::init(ctx, mode, disk_dir)
@@ -163,7 +164,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         .expect("failed to build tokio runtime");
 
     // Step 1: open the fabric.
-    let fabric = match transport::Fabric::start(&transport::config::configuration()) {
+    let fabric = match transport::Fabric::open() {
         Ok(fabric) => Some(fabric),
         Err(error) => {
             ctx.log_warning(&format!(
@@ -186,7 +187,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 
     let fabric_services = fabric.as_ref().map_or(0, transport::Fabric::service_count);
     if let Some(fabric) = &fabric {
-        for (index, address) in fabric.local_addresses().enumerate() {
+        for (index, address) in fabric.local_addresses().into_iter().enumerate() {
             ctx.log_notice(&format!(
                 "largeobj: fabric service {index} rdma address {}",
                 encode_hex(address)
@@ -326,6 +327,9 @@ valkey_module! {
         string: [
             ["disk-dir", &*CFG_DISK_DIR, "", ConfigurationFlags::IMMUTABLE, None],
             ["fabric-interfaces", &*CFG_FABRIC_INTERFACES, "", ConfigurationFlags::IMMUTABLE, None],
+            ["te-local-hostname", &*CFG_TE_LOCAL_HOSTNAME, "", ConfigurationFlags::IMMUTABLE, None],
+            ["te-metadata-server", &*CFG_TE_METADATA_SERVER, DEFAULT_TE_METADATA_SERVER, ConfigurationFlags::IMMUTABLE, None],
+            ["te-protocol", &*CFG_TE_PROTOCOL, DEFAULT_TE_PROTOCOL, ConfigurationFlags::IMMUTABLE, None],
         ],
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],

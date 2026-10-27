@@ -134,7 +134,11 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         FabricProvider::Emulated if rdma_address.is_empty() => {
             return Err(ValkeyError::Str(errors::ERR_RDMA_ADDR_EMPTY));
         }
-        FabricProvider::EfaDirect | FabricProvider::Emulated => {}
+        // A Transfer Engine segment name, e.g. `ip:rpc_port` under P2PHANDSHAKE.
+        FabricProvider::MooncakeTe if rdma_address.is_empty() => {
+            return Err(ValkeyError::Str(errors::ERR_RDMA_ADDR_EMPTY));
+        }
+        FabricProvider::EfaDirect | FabricProvider::Emulated | FabricProvider::MooncakeTe => {}
     }
 
     let client_id = ctx.get_client_id();
@@ -151,6 +155,7 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let reply: Vec<ValkeyValue> = fabric
         .local_addresses()
+        .into_iter()
         .map(|address| ValkeyValue::BulkString(encode_hex(address)))
         .collect();
     Ok(ValkeyValue::Array(reply))

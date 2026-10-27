@@ -27,6 +27,9 @@ talc = { version = "5", default-features = false, features = ["counters"] }
 # For the `Allocator` trait talc's TalcCell implements (safe allocate/deallocate).
 # Pinned to the version talc itself uses so there is a single shared trait.
 allocator-api2 = { version = "0.4", default-features = false }
+# Mooncake Transfer Engine backend (`fabric-provider MooncakeTe`). Its build script links a CMake
+# build of Transfer Engine: set MOONCAKE_BUILD_DIR (see the crate's README).
+transfer_engine_rust = { git = "https://github.com/kvcache-ai/Mooncake.git", rev = "719735896c86b56fabec6cf3e825fb2ea640597a", optional = true }
 
 [dev-dependencies]
 rstest = "0.23.0"
@@ -54,3 +57,4 @@ default = ["min-valkey-compatibility-version-8-0"]
 enable-system-alloc = ["valkey-module/enable-system-alloc", "valkey-module/test-shims"]
 min-valkey-compatibility-version-8-0 = []
 test-harness = []
+mooncake-te = ["dep:transfer_engine_rust"]

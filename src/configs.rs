@@ -138,6 +138,9 @@ pub const MAX_MAX_RDMA_REGISTERED_BYTES: i64 = i64::MAX;
 pub const DEFAULT_FABRIC_MAX_IN_FLIGHT: i64 = 0; // crate default
 pub const MIN_FABRIC_MAX_IN_FLIGHT: i64 = 0;
 pub const MAX_FABRIC_MAX_IN_FLIGHT: i64 = 65_536;
+// te-metadata-server, te-protocol
+pub const DEFAULT_TE_METADATA_SERVER: &str = "P2PHANDSHAKE";
+pub const DEFAULT_TE_PROTOCOL: &str = "efa";
 // fabric-crc-pool-threads
 pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 1;
 pub const MIN_FABRIC_CRC_POOL_THREADS: i64 = 1;
@@ -268,6 +271,17 @@ lazy_static::lazy_static! {
 
     /// Threads hashing checksummed transfers off the fabric workers. Default: one.
     pub static ref CFG_FABRIC_CRC_POOL_THREADS: AtomicI64 = AtomicI64::new(DEFAULT_FABRIC_CRC_POOL_THREADS);
+
+    // ─── Mooncake Transfer Engine Configs (fabric-provider MooncakeTe) ───
+
+    /// This host's address for the Transfer Engine handshake (`ip` or `ip:port`). Required.
+    pub static ref CFG_TE_LOCAL_HOSTNAME: Mutex<String> = Mutex::new(String::new());
+
+    /// Transfer Engine metadata service. Default: P2PHANDSHAKE (no external service).
+    pub static ref CFG_TE_METADATA_SERVER: Mutex<String> = Mutex::new(DEFAULT_TE_METADATA_SERVER.to_string());
+
+    /// Transfer Engine transport to install. Default: efa.
+    pub static ref CFG_TE_PROTOCOL: Mutex<String> = Mutex::new(DEFAULT_TE_PROTOCOL.to_string());
 
     /// Cap on segment bytes EFA-registered (DRAM pool + staging), kept under the EFA
     /// device's registration limit. 0 = no limit. Default: 380 GiB.
@@ -509,6 +523,27 @@ pub fn fabric_max_in_flight() -> usize {
 
 pub fn fabric_crc_pool_threads() -> usize {
     CFG_FABRIC_CRC_POOL_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn te_local_hostname() -> String {
+    CFG_TE_LOCAL_HOSTNAME
+        .lock()
+        .expect("CFG_TE_LOCAL_HOSTNAME lock unavailable")
+        .clone()
+}
+
+pub fn te_metadata_server() -> String {
+    CFG_TE_METADATA_SERVER
+        .lock()
+        .expect("CFG_TE_METADATA_SERVER lock unavailable")
+        .clone()
+}
+
+pub fn te_protocol() -> String {
+    CFG_TE_PROTOCOL
+        .lock()
+        .expect("CFG_TE_PROTOCOL lock unavailable")
+        .clone()
 }
 
 pub fn max_rdma_registered_bytes() -> u64 {

@@ -3,12 +3,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use dma_libfabric::asynchronous::Transfer;
 use dma_libfabric::{Direction, TransferRequest};
 use dma_libfabric_protocol::DmaError;
 use linkme::distributed_slice;
 
-use crate::transport::fabric;
+use crate::transport::fabric::{self, TransferHandle};
 use crate::transport::operand::PoolOperand;
 
 // ─── Session ─────────────────────────────────────────────────────────────────
@@ -42,7 +41,7 @@ impl Session {
         len: usize,
         rkey: u64,
         remote_addr: u64,
-    ) -> Result<Transfer<PoolOperand>, DmaError> {
+    ) -> Result<TransferHandle, DmaError> {
         self.transfer(Direction::ToPeer, buf_ptr, len, rkey, remote_addr, false)
     }
 
@@ -55,7 +54,7 @@ impl Session {
         len: usize,
         rkey: u64,
         remote_addr: u64,
-    ) -> Result<Transfer<PoolOperand>, DmaError> {
+    ) -> Result<TransferHandle, DmaError> {
         self.transfer(
             Direction::FromPeer { length: len },
             buf_ptr,
@@ -74,7 +73,7 @@ impl Session {
         rkey: u64,
         remote_addr: u64,
         want_checksum: bool,
-    ) -> Result<Transfer<PoolOperand>, DmaError> {
+    ) -> Result<TransferHandle, DmaError> {
         // A session only exists while a fabric does; it went away at shutdown.
         let fabric =
             fabric::fabric().ok_or_else(|| DmaError::Fabric("fabric is shut down".into()))?;

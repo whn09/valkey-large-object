@@ -1,18 +1,178 @@
-//! The fabric services: one `asynchronous::FabricService` per libfabric domain, started at module
-//! load and dropped at shutdown. Pool segments are registered on them at load.
-//! `BLOB.RDMA_HELLO` inserts the client's address on all of them. On disconnect the client's entry on
-//! each is released.
+//! The fabric: the transport backend chosen by `fabric-provider`, started at module load and
+//! dropped at shutdown. Pool segments are registered on it at load. `BLOB.RDMA_HELLO` adds the
+//! client as a peer. On disconnect the client's peer entry is released.
+//!
+//! - libfabric (`Emulated`, `EfaDirect`): one `asynchronous::FabricService` per libfabric domain.
+//! - Mooncake Transfer Engine (`MooncakeTe`, cargo feature `mooncake-te`): see `transport::te`.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context, Poll};
 
 use dma_libfabric::asynchronous::{FabricService, Transfer};
-use dma_libfabric::{discover_domains, Configuration, MemoryRegion, Pool, TransferRequest};
+use dma_libfabric::{
+    discover_domains, Configuration, MemoryRegion, Outcome, Pool, TransferRequest,
+};
 use dma_libfabric_protocol::DmaError;
 use rand::RngExt;
 
+use crate::transport::config::FabricProvider;
 use crate::transport::operand::PoolOperand;
+#[cfg(feature = "mooncake-te")]
+use crate::transport::te::{TeBackend, TeConfig, TeTransfer};
 
 pub struct Fabric {
+    backend: Backend,
+}
+
+enum Backend {
+    Libfabric(Libfabric),
+    #[cfg(feature = "mooncake-te")]
+    MooncakeTe(TeBackend),
+}
+
+impl std::fmt::Debug for Fabric {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let backend = match &self.backend {
+            Backend::Libfabric(_) => "libfabric",
+            #[cfg(feature = "mooncake-te")]
+            Backend::MooncakeTe(_) => "mooncake-te",
+        };
+        formatter
+            .debug_struct("Fabric")
+            .field("backend", &backend)
+            .field("services", &self.service_count())
+            .finish()
+    }
+}
+
+impl Fabric {
+    /// Open the backend `fabric-provider` names.
+    pub fn open() -> Result<Self, String> {
+        let backend = match crate::fabric_provider() {
+            FabricProvider::Emulated | FabricProvider::EfaDirect => {
+                Backend::Libfabric(Libfabric::start(&crate::transport::config::configuration())?)
+            }
+            #[cfg(feature = "mooncake-te")]
+            FabricProvider::MooncakeTe => Backend::MooncakeTe(TeBackend::start(&TeConfig {
+                local_hostname: crate::te_local_hostname(),
+                metadata_server: crate::te_metadata_server(),
+                protocol: crate::te_protocol(),
+            })?),
+            #[cfg(not(feature = "mooncake-te"))]
+            FabricProvider::MooncakeTe => {
+                return Err(
+                    "this build has no Mooncake Transfer Engine (feature mooncake-te)".into(),
+                )
+            }
+        };
+        Ok(Self { backend })
+    }
+
+    pub fn service_count(&self) -> usize {
+        match &self.backend {
+            Backend::Libfabric(libfabric) => libfabric.services.len(),
+            #[cfg(feature = "mooncake-te")]
+            Backend::MooncakeTe(_) => 1,
+        }
+    }
+
+    pub fn transfer(
+        &self,
+        request: TransferRequest<PoolOperand>,
+    ) -> Result<TransferHandle, DmaError> {
+        match &self.backend {
+            Backend::Libfabric(libfabric) => {
+                libfabric.transfer(request).map(TransferHandle::Libfabric)
+            }
+            #[cfg(feature = "mooncake-te")]
+            Backend::MooncakeTe(te) => te.transfer(request).map(TransferHandle::MooncakeTe),
+        }
+    }
+
+    /// Register ONE segment with the backend so any transfer can use it. Fatal-on-failure policy
+    /// lives with the caller (`efa_register_segment`).
+    pub fn register_segment(&self, segment: &'static [u8]) -> Result<(), String> {
+        match &self.backend {
+            Backend::Libfabric(libfabric) => libfabric.register_segment(segment),
+            #[cfg(feature = "mooncake-te")]
+            Backend::MooncakeTe(te) => te.register_segment(segment),
+        }
+    }
+
+    /// Drop a segment's registration by base. MUST run before the segment memory is freed.
+    pub fn release_segment(&self, base: usize) {
+        match &self.backend {
+            Backend::Libfabric(libfabric) => libfabric.release_segment(base),
+            #[cfg(feature = "mooncake-te")]
+            Backend::MooncakeTe(te) => te.release_segment(base),
+        }
+    }
+
+    /// Whether the segment at `base` is currently registered.
+    pub fn is_registered(&self, base: usize) -> bool {
+        match &self.backend {
+            Backend::Libfabric(libfabric) => libfabric.is_registered(base),
+            #[cfg(feature = "mooncake-te")]
+            Backend::MooncakeTe(te) => te.is_registered(base),
+        }
+    }
+
+    /// Make the client reachable at BLOB.RDMA_HELLO, so an unusable address fails the hello.
+    pub fn add_peer(&self, client_id: u64, address: &[u8]) -> Result<(), String> {
+        match &self.backend {
+            Backend::Libfabric(libfabric) => libfabric.add_peer(client_id, address),
+            #[cfg(feature = "mooncake-te")]
+            Backend::MooncakeTe(te) => te.add_peer(client_id, address),
+        }
+    }
+
+    /// One address per service, in service order; what `BLOB.RDMA_HELLO` returns.
+    pub fn local_addresses(&self) -> Vec<&[u8]> {
+        match &self.backend {
+            Backend::Libfabric(libfabric) => libfabric.local_addresses().collect(),
+            #[cfg(feature = "mooncake-te")]
+            Backend::MooncakeTe(te) => vec![te.local_address()],
+        }
+    }
+
+    /// Release the client's peer entry once its transfers drain.
+    pub fn remove_peer(&self, client_id: u64) {
+        match &self.backend {
+            Backend::Libfabric(libfabric) => libfabric.remove_peer(client_id),
+            #[cfg(feature = "mooncake-te")]
+            Backend::MooncakeTe(te) => te.remove_peer(client_id),
+        }
+    }
+}
+
+/// A submitted transfer on either backend. Resolves to its outcome.
+pub enum TransferHandle {
+    Libfabric(Transfer<PoolOperand>),
+    #[cfg(feature = "mooncake-te")]
+    MooncakeTe(TeTransfer),
+}
+
+impl Future for TransferHandle {
+    type Output = (Outcome, ());
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut() {
+            Self::Libfabric(transfer) => Pin::new(transfer)
+                .poll(context)
+                .map(|(outcome, _operand)| (outcome, ())),
+            #[cfg(feature = "mooncake-te")]
+            Self::MooncakeTe(transfer) => Pin::new(transfer)
+                .poll(context)
+                .map(|outcome| (outcome, ())),
+        }
+    }
+}
+
+// ─── libfabric backend ───────────────────────────────────────────────────────
+
+struct Libfabric {
     services: Vec<FabricService<PoolOperand>>,
     /// EFA registrations keyed by segment base (one `MemoryRegion` per service), retained for the
     /// segment's lifetime. `release_segment` drops them before the memory is freed. `Mutex` because
@@ -22,16 +182,7 @@ pub struct Fabric {
     _pool: Arc<Pool>,
 }
 
-impl std::fmt::Debug for Fabric {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Fabric")
-            .field("services", &self.services.len())
-            .finish()
-    }
-}
-
-impl Fabric {
+impl Libfabric {
     /// Open one service per domain: the configured allowlist, or every domain the provider
     /// exposes. Blocks until each endpoint is up, and one failing fails the lot.
     pub fn start(configuration: &Configuration) -> Result<Self, String> {
@@ -60,10 +211,6 @@ impl Fabric {
             regions: Mutex::new(std::collections::HashMap::new()),
             _pool: pool,
         })
-    }
-
-    pub fn service_count(&self) -> usize {
-        self.services.len()
     }
 
     /// Submit on the best of two services picked at random, by transfers outstanding.

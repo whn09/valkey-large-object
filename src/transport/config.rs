@@ -15,23 +15,28 @@ enum_configuration! {
         Emulated = 0,
         /// Use EFA hardware, the libfabric efa provider via efa-direct path.
         EfaDirect = 1,
+        /// Use the Mooncake Transfer Engine instead of libfabric (cargo feature `mooncake-te`).
+        /// Its own `te-*` args configure it; the `fabric-*` args do not apply.
+        MooncakeTe = 2,
     }
 }
 
-impl From<FabricProvider> for Provider {
-    fn from(provider: FabricProvider) -> Self {
-        match provider {
-            FabricProvider::Emulated => Provider::Tcp,
-            FabricProvider::EfaDirect => Provider::EfaDirect,
-        }
+/// The libfabric provider behind a `fabric-provider`, or `None` for a non-libfabric backend.
+fn libfabric_provider(provider: FabricProvider) -> Option<Provider> {
+    match provider {
+        FabricProvider::Emulated => Some(Provider::Tcp),
+        FabricProvider::EfaDirect => Some(Provider::EfaDirect),
+        FabricProvider::MooncakeTe => None,
     }
 }
 
-/// The configuration every server starts from. `interfaces` is the allowlist of domains to serve
+/// The libfabric configuration every server starts from. Only used for the libfabric providers. `interfaces` is the allowlist of domains to serve
 /// on (empty: every domain discovered); `Fabric::start` pins each server to one of them.
 pub fn configuration() -> Configuration {
     Configuration {
-        providers: vec![crate::fabric_provider().into()],
+        providers: libfabric_provider(crate::fabric_provider())
+            .into_iter()
+            .collect(),
         interfaces: crate::fabric_interfaces(),
         bind: None,
         max_in_flight: nonzero(crate::fabric_max_in_flight()),

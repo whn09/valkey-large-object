@@ -18,6 +18,12 @@ impl PoolOperand {
     pub fn new(pointer: *mut u8, length: usize) -> Self {
         Self { pointer, length }
     }
+
+    /// The allocation as a raw `(pointer, length)`, for a backend that takes raw local addresses.
+    #[cfg_attr(not(feature = "mooncake-te"), allow(dead_code))]
+    pub fn raw_parts(&self) -> (*mut u8, usize) {
+        (self.pointer, self.length)
+    }
 }
 
 // SAFETY: segment memory is stable for the module's lifetime, and the range is a talc allocation
