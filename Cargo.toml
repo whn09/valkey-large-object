@@ -33,6 +33,7 @@ transfer_engine_rust = { git = "https://github.com/kvcache-ai/Mooncake.git", rev
 
 [dev-dependencies]
 rstest = "0.23.0"
+tokio = { version = "1", features = ["macros"] }
 
 [lib]
 crate-type = ["cdylib"]
